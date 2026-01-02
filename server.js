@@ -3,7 +3,6 @@ const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
 const cron = require('node-cron');
 const express = require('express');
-const path = require('path');
 const { GoogleGenAI } = require('@google/genai');
 
 // --- CONFIGURATION ---
@@ -22,6 +21,18 @@ let weatherCache = null;
 let lastFetchTime = 0;
 let geminiBlockedUntil = 0;
 
+// Log configuration status for debugging
+console.log("🛠 Boot diagnostics:");
+console.log("- BOT_TOKEN:", BOT_TOKEN ? "✅ OK" : "❌ MISSING");
+console.log("- CHAT_ID:", CHAT_ID ? "✅ OK" : "❌ MISSING");
+console.log("- OPENWEATHER_KEY:", OPENWEATHER_API_KEY ? "✅ OK" : "⚠️ MISSING (Using fallback)");
+console.log("- GEMINI_KEY:", API_KEY ? "✅ OK" : "❌ MISSING");
+
+if (!BOT_TOKEN) {
+  console.error("FATAL: BOT_TOKEN is required to start.");
+  process.exit(1);
+}
+
 const bot = new Telegraf(BOT_TOKEN);
 
 // --- GEMINI SEARCH FALLBACK ---
@@ -36,8 +47,11 @@ async function getWeatherViaGemini() {
   try {
     const response = await ai.models.generateContent({
       model: 'gemini-3-flash-preview',
-      contents: "Weather in Limassol (temp Celsius, precip mm last hour)? JSON ONLY: {\"temp\": 20, \"precip\": 0}",
-      config: { tools: [{ googleSearch: {} }] }
+      contents: "Exactly current weather in Limassol (temp Celsius, precipitation mm last hour)? Respond JSON ONLY: {\"temp\": 20, \"precip\": 0}",
+      config: { 
+        tools: [{ googleSearch: {} }],
+        thinkingConfig: { thinkingBudget: 0 } 
+      }
     });
 
     const jsonMatch = response.text?.match(/\{.*\}/s);
@@ -47,31 +61,32 @@ async function getWeatherViaGemini() {
         current: {
           temp: parsed.temp ?? 20,
           precip: parsed.precip ?? 0,
-          description: parsed.precip > 0.1 ? 'Rain' : 'Clear'
+          description: (parsed.precip > 0.1) ? 'Rain' : 'Clear'
         }
       };
     }
     throw new Error("Invalid Gemini response format");
   } catch (e) {
-    if (JSON.stringify(e).includes('429')) geminiBlockedUntil = now + (10 * 60 * 1000);
+    console.error("Gemini Error:", e.message);
+    if (JSON.stringify(e).includes('429')) geminiBlockedUntil = now + (15 * 60 * 1000);
     throw e;
   }
 }
 
-// --- WEATHER FETCHING VIA OPENWEATHER ---
+// --- WEATHER FETCHING ---
 async function getWeather() {
   const now = Date.now();
   
-  // 1. Fresh cache (10 mins)
-  if (weatherCache && (now - lastFetchTime < 10 * 60 * 1000)) {
+  // 1. Fresh cache (15 mins)
+  if (weatherCache && (now - lastFetchTime < 15 * 60 * 1000)) {
     return weatherCache;
   }
 
   // 2. Try OpenWeather API
   if (OPENWEATHER_API_KEY) {
     try {
-      const url = `https://api.openweathermap.org/data/2.5/weather?lat=${LAT}&lon=${LNG}&appid=${OPENWEATHER_API_KEY}&units=metric`;
-      const { data } = await axios.get(url, { timeout: 8000 });
+      const url = `https://api.openweathermap.org/data/2.5/weather?lat=${LAT}&lon=${LNG}&appid=${OPENWEATHER_API_KEY.trim()}&units=metric`;
+      const { data } = await axios.get(url, { timeout: 10000 });
       
       const processedData = {
         current: {
@@ -85,7 +100,7 @@ async function getWeather() {
       lastFetchTime = now;
       return processedData;
     } catch (e) {
-      console.warn("🛑 OpenWeather request failed, trying fallback.");
+      console.warn(`🛑 OpenWeather failed (${e.response?.status || e.message}). Trying Gemini.`);
     }
   }
 
@@ -97,10 +112,10 @@ async function getWeather() {
     return geminiData;
   } catch (e) {
     if (weatherCache) {
-      console.log("📦 Returning stale cache as last resort.");
+      console.log("📦 Emergency: Using old cache.");
       return weatherCache;
     }
-    throw new Error("No weather data available.");
+    throw new Error("All weather providers failed.");
   }
 }
 
@@ -112,48 +127,63 @@ async function checkWeatherTask() {
     const rainingNow = current.precip >= RAIN_THRESHOLD;
 
     if (rainingNow && !wasRaining) {
-      await bot.telegram.sendMessage(CHAT_ID, `🌧 Внимание! В Лимассоле дождь (${current.precip} мм). Пора спасать белье! 🧺`);
+      await bot.telegram.sendMessage(CHAT_ID, `🌧 Дождь! (${current.precip} мм). Снимай белье! 🧺`);
     } else if (!rainingNow && wasRaining) {
-      await bot.telegram.sendMessage(CHAT_ID, "☀️ Дождь прекратился. Небо проясняется.");
+      await bot.telegram.sendMessage(CHAT_ID, "☀️ Прояснилось.");
     }
     wasRaining = rainingNow;
   } catch (e) {
-    console.error("Task failed:", e.message);
+    console.error("Task error:", e.message);
   }
 }
 
 // --- BOT INTERFACE ---
 const mainMenu = Markup.keyboard([['🌡️ Погода сейчас', 'ℹ️ Помощь']]).resize();
 
-bot.start((ctx) => ctx.reply("🛡️ RainGuard v3.0 (OpenWeather Edition). Мониторинг запущен.", mainMenu));
+bot.start((ctx) => ctx.reply("🛡️ RainGuard v3.1 активен.", mainMenu));
 
 bot.hears('🌡️ Погода сейчас', async (ctx) => {
   try {
     const data = await getWeather();
     const c = data.current;
-    const isStale = (Date.now() - lastFetchTime) > 20 * 60 * 1000;
-    ctx.reply(`📍 Лимассол:\n🌡 ${c.temp}°C\n💧 Осадки: ${c.precip} мм\n☁️ ${c.description}${isStale ? '\n⚠️ (Кэшированные данные)' : ''}`);
+    ctx.reply(`📍 Лимассол:\n🌡 ${c.temp}°C\n💧 Осадки: ${c.precip} мм\n☁️ ${c.description}`);
   } catch (e) {
-    ctx.reply("❌ Ошибка получения данных. Попробуйте позже.");
+    ctx.reply("❌ Ошибка датчиков.");
   }
 });
 
-bot.hears('ℹ️ Помощь', (ctx) => ctx.reply("Бот RainGuard. Использует OpenWeather API + Gemini AI для надежности. Проверка каждые 30 минут."));
+bot.hears('ℹ️ Помощь', (ctx) => ctx.reply("Мониторинг каждые 30 мин. Порог: 0.5мм осадков."));
 
 // --- SERVER SETUP ---
 const app = express();
-app.use(express.static(__dirname));
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
 if (RENDER_URL && BOT_TOKEN) {
   const webhookPath = `/bot${BOT_TOKEN}`;
   app.use(bot.webhookCallback(webhookPath));
-  bot.telegram.setWebhook(`${RENDER_URL}${webhookPath}`).catch(console.error);
-} else if (BOT_TOKEN) {
-  bot.launch().catch(console.error);
+  bot.telegram.setWebhook(`${RENDER_URL}${webhookPath}`)
+    .then(() => console.log(`🚀 Webhook set: ${RENDER_URL}`))
+    .catch(e => console.error("Webhook error:", e.message));
+} else {
+  bot.launch().then(() => console.log("🤖 Polling started"));
 }
 
 app.listen(process.env.PORT || 3000, () => {
-  console.log("Server running. Task scheduled.");
+  console.log("💻 Server ready.");
   cron.schedule('*/30 * * * *', checkWeatherTask);
 });
+
+// Safe Shutdown
+const shutdown = (signal) => {
+  console.log(`${signal} received. Cleaning up...`);
+  try {
+    // Only stop if running in polling mode, avoid crash in webhook mode
+    if (!RENDER_URL) bot.stop(signal);
+  } catch (e) {
+    // Ignore "Bot is not running" error
+  }
+  process.exit(0);
+};
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
