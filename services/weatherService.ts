@@ -2,12 +2,17 @@
 import { WeatherData } from '../types';
 import { GoogleGenAI } from "@google/genai";
 
-const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+let browserCache: {current: WeatherData, forecast: WeatherData[]} | null = null;
+let lastFetch = 0;
 
 const getGeminiWeatherFallback = async (): Promise<{current: WeatherData, forecast: WeatherData[]}> => {
+  const apiKey = process.env.API_KEY || '';
+  if (!apiKey) throw new Error("No API Key");
+  
+  const ai = new GoogleGenAI({ apiKey });
   const response = await ai.models.generateContent({
     model: 'gemini-3-flash-preview',
-    contents: "What is the exact current weather in Limassol? Give me temperature and precipitation. Format as JSON: {\"temp\": 25, \"precip\": 0}",
+    contents: "What is the current weather in Limassol? Respond strictly JSON: {\"temp\": 25, \"precip\": 0}",
     config: { tools: [{ googleSearch: {} }] }
   });
 
@@ -28,6 +33,11 @@ const getGeminiWeatherFallback = async (): Promise<{current: WeatherData, foreca
 };
 
 export const fetchWeather = async (lat: number, lng: number): Promise<{current: WeatherData, forecast: WeatherData[]}> => {
+  const now = Date.now();
+  if (browserCache && (now - lastFetch < 15 * 60 * 1000)) {
+    return browserCache;
+  }
+
   const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,precipitation,wind_speed_10m&hourly=temperature_2m,precipitation,wind_speed_10m&timezone=auto`;
   
   try {
@@ -51,11 +61,18 @@ export const fetchWeather = async (lat: number, lng: number): Promise<{current: 
       timestamp: new Date(time).getTime()
     }));
 
-    return { current, forecast };
+    browserCache = { current, forecast };
+    lastFetch = now;
+    return browserCache;
   } catch (err: any) {
-    if (err.message === "429") {
-      return await getGeminiWeatherFallback();
+    try {
+      const fallback = await getGeminiWeatherFallback();
+      browserCache = fallback;
+      lastFetch = now;
+      return fallback;
+    } catch (fallbackErr) {
+      if (browserCache) return browserCache;
+      throw err;
     }
-    throw err;
   }
 };
