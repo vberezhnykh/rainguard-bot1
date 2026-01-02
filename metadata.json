@@ -1,0 +1,7 @@
+{
+  "name": "RainGuard Bot Architect",
+  "description": "A sophisticated dashboard to configure and simulate a Telegram bot that monitors weather to protect your laundry. Features 15-minute interval checks, 12-hour rain forecasting, and urgent alerts before rain starts.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
