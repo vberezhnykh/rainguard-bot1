@@ -1,8 +1,8 @@
 
 {
-  "name": "rainguard-bot-v2.8",
-  "version": "2.8.0",
-  "description": "Telegram Weather Bot with laundry protection logic and simulator UI",
+  "name": "rainguard-bot-v4.1",
+  "version": "4.1.0",
+  "description": "Telegram Weather Bot with Gemini Natural Language (Search Disabled)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

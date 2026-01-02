@@ -12,6 +12,8 @@ services:
         sync: false
       - key: CHAT_ID
         sync: false
+      - key: OPENWEATHER_API_KEY
+        sync: false
       - key: API_KEY
         sync: false
       - key: NODE_VERSION
