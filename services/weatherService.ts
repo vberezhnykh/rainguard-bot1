@@ -12,7 +12,7 @@ const getGeminiWeatherFallback = async (): Promise<{current: WeatherData, foreca
   const ai = new GoogleGenAI({ apiKey });
   const response = await ai.models.generateContent({
     model: 'gemini-3-flash-preview',
-    contents: "What is the current weather in Limassol? Respond strictly JSON: {\"temp\": 25, \"precip\": 0}",
+    contents: "Current weather in Limassol? JSON ONLY: {\"temp\": 25, \"precip\": 0, \"wind\": 10, \"desc\": \"Clear\"}",
     config: { tools: [{ googleSearch: {} }] }
   });
 
@@ -23,8 +23,8 @@ const getGeminiWeatherFallback = async (): Promise<{current: WeatherData, foreca
     const current: WeatherData = {
       temp: data.temp,
       precipitation: data.precip,
-      windSpeed: 10,
-      description: data.precip > 0 ? 'Rainy' : 'Clear',
+      windSpeed: data.wind || 10,
+      description: data.desc || (data.precip > 0 ? 'Rainy' : 'Clear'),
       timestamp: Date.now()
     };
     return { current, forecast: [] };
@@ -34,45 +34,57 @@ const getGeminiWeatherFallback = async (): Promise<{current: WeatherData, foreca
 
 export const fetchWeather = async (lat: number, lng: number): Promise<{current: WeatherData, forecast: WeatherData[]}> => {
   const now = Date.now();
-  if (browserCache && (now - lastFetch < 15 * 60 * 1000)) {
+  if (browserCache && (now - lastFetch < 10 * 60 * 1000)) {
     return browserCache;
   }
 
-  const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,precipitation,wind_speed_10m&hourly=temperature_2m,precipitation,wind_speed_10m&timezone=auto`;
+  // Using standard OpenWeather API (requires OPENWEATHER_API_KEY env var)
+  const openWeatherKey = (process.env as any).OPENWEATHER_API_KEY;
   
+  if (openWeatherKey) {
+    try {
+      const url = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lng}&appid=${openWeatherKey}&units=metric`;
+      const response = await fetch(url);
+      if (!response.ok) throw new Error("OpenWeather fetch failed");
+      const data = await response.json();
+
+      const current: WeatherData = {
+        temp: data.main.temp,
+        precipitation: data.rain ? (data.rain['1h'] || data.rain['3h'] / 3 || 0) : 0,
+        windSpeed: data.wind.speed * 3.6, // m/s to km/h
+        description: data.weather[0].main,
+        timestamp: Date.now()
+      };
+
+      // Forecast fetch
+      const forecastUrl = `https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lng}&appid=${openWeatherKey}&units=metric`;
+      const fResponse = await fetch(forecastUrl);
+      const fData = await fResponse.json();
+      
+      const forecast: WeatherData[] = fData.list.map((item: any) => ({
+        temp: item.main.temp,
+        precipitation: item.rain ? (item.rain['3h'] / 3) : 0,
+        windSpeed: item.wind.speed * 3.6,
+        description: item.weather[0].main,
+        timestamp: item.dt * 1000
+      }));
+
+      browserCache = { current, forecast };
+      lastFetch = now;
+      return browserCache;
+    } catch (err) {
+      console.warn("OpenWeather Error in simulator:", err);
+    }
+  }
+
+  // Fallback to Gemini or Stale Cache
   try {
-    const response = await fetch(url);
-    if (response.status === 429) throw new Error("429");
-    const data = await response.json();
-
-    const current: WeatherData = {
-      temp: data.current.temperature_2m,
-      precipitation: data.current.precipitation,
-      windSpeed: data.current.wind_speed_10m,
-      description: data.current.precipitation > 0 ? 'Rainy' : 'Clear',
-      timestamp: Date.now()
-    };
-
-    const forecast: WeatherData[] = data.hourly.time.map((time: string, index: number) => ({
-      temp: data.hourly.temperature_2m[index],
-      precipitation: data.hourly.precipitation[index],
-      windSpeed: data.hourly.wind_speed_10m[index],
-      description: data.hourly.precipitation[index] > 0 ? 'Rainy' : 'Clear',
-      timestamp: new Date(time).getTime()
-    }));
-
-    browserCache = { current, forecast };
+    const fallback = await getGeminiWeatherFallback();
+    browserCache = { ...fallback, forecast: browserCache?.forecast || [] };
     lastFetch = now;
     return browserCache;
-  } catch (err: any) {
-    try {
-      const fallback = await getGeminiWeatherFallback();
-      browserCache = fallback;
-      lastFetch = now;
-      return fallback;
-    } catch (fallbackErr) {
-      if (browserCache) return browserCache;
-      throw err;
-    }
+  } catch (fallbackErr) {
+    if (browserCache) return browserCache;
+    throw new Error("Weather services currently unavailable.");
   }
 };

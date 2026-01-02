@@ -9,7 +9,8 @@ const { GoogleGenAI } = require('@google/genai');
 // --- CONFIGURATION ---
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
-const API_KEY = process.env.API_KEY;
+const API_KEY = process.env.API_KEY; // Gemini API Key
+const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY; 
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL; 
 const LAT = 34.6593; 
 const LNG = 33.0038;
@@ -19,97 +20,87 @@ const RAIN_THRESHOLD = 0.5;
 let wasRaining = false;
 let weatherCache = null;
 let lastFetchTime = 0;
-let isIpBlocked = false;
-let blockedUntil = 0;
 let geminiBlockedUntil = 0;
 
 const bot = new Telegraf(BOT_TOKEN);
 
-// --- GEMINI FALLBACK WITH QUOTA MANAGEMENT ---
+// --- GEMINI SEARCH FALLBACK ---
 async function getWeatherViaGemini() {
   const now = Date.now();
-  if (!API_KEY) throw new Error("API_KEY is missing");
-  if (now < geminiBlockedUntil) {
-    console.log("⏳ Gemini is in cooldown, skipping...");
-    throw new Error("Gemini Cooldown");
-  }
+  if (!API_KEY) throw new Error("API_KEY missing");
+  if (now < geminiBlockedUntil) throw new Error("Gemini cooling down");
 
-  console.log("🔄 Requesting weather via Gemini Search...");
+  console.log("🔄 Using Gemini fallback for weather...");
   const ai = new GoogleGenAI({ apiKey: API_KEY });
   
   try {
     const response = await ai.models.generateContent({
       model: 'gemini-3-flash-preview',
-      contents: "What is the current temperature and precipitation (mm) in Limassol, Cyprus? Return ONLY a JSON: {\"temp\": 20, \"precip\": 0}",
+      contents: "Weather in Limassol (temp Celsius, precip mm last hour)? JSON ONLY: {\"temp\": 20, \"precip\": 0}",
       config: { tools: [{ googleSearch: {} }] }
     });
 
-    const text = response.text || "";
-    const jsonMatch = text.match(/\{.*\}/s);
+    const jsonMatch = response.text?.match(/\{.*\}/s);
     if (jsonMatch) {
       const parsed = JSON.parse(jsonMatch[0]);
       return {
         current: {
-          temperature_2m: parsed.temp ?? 20,
-          precipitation: parsed.precip ?? 0,
-          weather_code: (parsed.precip > 0.5) ? 61 : 0
-        },
-        hourly: { time: [], precipitation: [], weather_code: [] }
+          temp: parsed.temp ?? 20,
+          precip: parsed.precip ?? 0,
+          description: parsed.precip > 0.1 ? 'Rain' : 'Clear'
+        }
       };
     }
-    throw new Error("No JSON in Gemini response");
+    throw new Error("Invalid Gemini response format");
   } catch (e) {
-    const errorStr = JSON.stringify(e);
-    if (errorStr.includes('429') || errorStr.includes('RESOURCE_EXHAUSTED')) {
-      console.error("🛑 Gemini Quota Exhausted. Cooling down for 15m.");
-      geminiBlockedUntil = now + (15 * 60 * 1000);
-    }
+    if (JSON.stringify(e).includes('429')) geminiBlockedUntil = now + (10 * 60 * 1000);
     throw e;
   }
 }
 
-// --- RESILIENT WEATHER FETCHING ---
+// --- WEATHER FETCHING VIA OPENWEATHER ---
 async function getWeather() {
   const now = Date.now();
   
-  // 1. Return fresh cache if available (within 20 mins)
-  if (weatherCache && (now - lastFetchTime < 20 * 60 * 1000)) {
+  // 1. Fresh cache (10 mins)
+  if (weatherCache && (now - lastFetchTime < 10 * 60 * 1000)) {
     return weatherCache;
   }
 
-  // 2. Try Open-Meteo if not explicitly blocked
-  if (!isIpBlocked || now > blockedUntil) {
+  // 2. Try OpenWeather API
+  if (OPENWEATHER_API_KEY) {
     try {
-      const url = `https://api.open-meteo.com/v1/forecast?latitude=${LAT}&longitude=${LNG}&current=temperature_2m,precipitation,weather_code&hourly=temperature_2m,precipitation,weather_code&timezone=auto`;
-      const { data } = await axios.get(url, { timeout: 10000 });
+      const url = `https://api.openweathermap.org/data/2.5/weather?lat=${LAT}&lon=${LNG}&appid=${OPENWEATHER_API_KEY}&units=metric`;
+      const { data } = await axios.get(url, { timeout: 8000 });
       
-      isIpBlocked = false;
-      weatherCache = data;
+      const processedData = {
+        current: {
+          temp: data.main.temp,
+          precip: data.rain ? (data.rain['1h'] || data.rain['3h'] / 3 || 0) : 0,
+          description: data.weather[0].main
+        }
+      };
+      
+      weatherCache = processedData;
       lastFetchTime = now;
-      return data;
+      return processedData;
     } catch (e) {
-      if (e.response && e.response.status === 429) {
-        console.warn("🛑 Open-Meteo blocked (429).");
-        isIpBlocked = true;
-        blockedUntil = now + (60 * 60 * 1000);
-      }
+      console.warn("🛑 OpenWeather request failed, trying fallback.");
     }
   }
 
-  // 3. Fallback to Gemini
+  // 3. Fallback: Gemini
   try {
     const geminiData = await getWeatherViaGemini();
     weatherCache = geminiData;
     lastFetchTime = now;
     return geminiData;
   } catch (e) {
-    console.error("⚠️ All APIs failed or exhausted.");
-    // 4. SUPREME FALLBACK: If everything fails, return the last known good data (even if old)
     if (weatherCache) {
       console.log("📦 Returning stale cache as last resort.");
       return weatherCache;
     }
-    throw new Error("No weather data available at all.");
+    throw new Error("No weather data available.");
   }
 }
 
@@ -118,68 +109,51 @@ async function checkWeatherTask() {
   try {
     const data = await getWeather();
     const current = data.current;
-    const rainingNow = current.weather_code >= 51 || current.precipitation >= RAIN_THRESHOLD;
+    const rainingNow = current.precip >= RAIN_THRESHOLD;
 
     if (rainingNow && !wasRaining) {
-      await bot.telegram.sendMessage(CHAT_ID, `🚨 СРОЧНО! В Лимассоле дождь (${current.precipitation} мм). Уберите вещи! 🧺`);
+      await bot.telegram.sendMessage(CHAT_ID, `🌧 Внимание! В Лимассоле дождь (${current.precip} мм). Пора спасать белье! 🧺`);
     } else if (!rainingNow && wasRaining) {
-      await bot.telegram.sendMessage(CHAT_ID, "☀️ Дождь прекратился. Можно сушить вещи!");
+      await bot.telegram.sendMessage(CHAT_ID, "☀️ Дождь прекратился. Небо проясняется.");
     }
     wasRaining = rainingNow;
   } catch (e) {
-    console.error("Task error:", e.message);
+    console.error("Task failed:", e.message);
   }
 }
 
-// --- BOT LOGIC ---
-const mainMenu = Markup.keyboard([
-  ['🌡️ Погода сейчас', '📅 Прогноз на день'],
-  ['🌙 Прогноз на ночь', 'ℹ️ Помощь']
-]).resize();
+// --- BOT INTERFACE ---
+const mainMenu = Markup.keyboard([['🌡️ Погода сейчас', 'ℹ️ Помощь']]).resize();
 
-bot.start((ctx) => ctx.reply("🛡️ RainGuard v2.9.2 активен. Я буду использовать кэш, если лимиты API будут превышены.", mainMenu));
+bot.start((ctx) => ctx.reply("🛡️ RainGuard v3.0 (OpenWeather Edition). Мониторинг запущен.", mainMenu));
 
 bot.hears('🌡️ Погода сейчас', async (ctx) => {
   try {
     const data = await getWeather();
     const c = data.current;
-    const minutesAgo = Math.floor((Date.now() - lastFetchTime) / 60000);
-    const statusNote = minutesAgo > 30 ? `\n⚠️ (Данные получены ${minutesAgo} мин. назад, лимиты API превышены)` : "";
-    
-    ctx.reply(`📍 Лимассол:\n🌡 ${c.temperature_2m}°C\n💧 Осадки: ${c.precipitation} мм${statusNote}`);
+    const isStale = (Date.now() - lastFetchTime) > 20 * 60 * 1000;
+    ctx.reply(`📍 Лимассол:\n🌡 ${c.temp}°C\n💧 Осадки: ${c.precip} мм\n☁️ ${c.description}${isStale ? '\n⚠️ (Кэшированные данные)' : ''}`);
   } catch (e) {
-    ctx.reply("❌ Извините, сейчас невозможно получить данные даже через резервные каналы. Попробуйте через 15 минут.");
+    ctx.reply("❌ Ошибка получения данных. Попробуйте позже.");
   }
 });
 
-bot.hears('ℹ️ Помощь', (ctx) => ctx.reply("Бот RainGuard. Проверка дождя каждые 30 минут. При сбоях API используется кэширование."));
+bot.hears('ℹ️ Помощь', (ctx) => ctx.reply("Бот RainGuard. Использует OpenWeather API + Gemini AI для надежности. Проверка каждые 30 минут."));
 
-// --- WEB SERVER & STARTUP ---
+// --- SERVER SETUP ---
 const app = express();
 app.use(express.static(__dirname));
 app.get('/health', (req, res) => res.status(200).send('OK'));
 
-const PORT = process.env.PORT || 3000;
-
 if (RENDER_URL && BOT_TOKEN) {
-  // WEBHOOK MODE (For Production/Render)
   const webhookPath = `/bot${BOT_TOKEN}`;
   app.use(bot.webhookCallback(webhookPath));
-  bot.telegram.setWebhook(`${RENDER_URL}${webhookPath}`)
-    .then(() => console.log(`🚀 Webhook set: ${RENDER_URL}`))
-    .catch(err => console.error("Webhook error:", err));
+  bot.telegram.setWebhook(`${RENDER_URL}${webhookPath}`).catch(console.error);
 } else if (BOT_TOKEN) {
-  // POLLING MODE (For local dev only)
-  console.log("⚡ Starting in POLLING mode...");
-  bot.launch().catch(err => console.error("Polling error:", err));
+  bot.launch().catch(console.error);
 }
 
-app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
-
-app.listen(PORT, () => {
-  console.log(`Server online on port ${PORT}`);
-  cron.schedule('5,35 * * * *', checkWeatherTask);
+app.listen(process.env.PORT || 3000, () => {
+  console.log("Server running. Task scheduled.");
+  cron.schedule('*/30 * * * *', checkWeatherTask);
 });
-
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
